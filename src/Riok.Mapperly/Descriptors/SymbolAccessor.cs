@@ -1,6 +1,8 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
+using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -43,6 +45,124 @@ public class SymbolAccessor(CompilationContext compilationContext, INamedTypeSym
     internal void SetMemberVisibility(MemberVisibility visibility) => _memberVisibility = visibility;
 
     internal void SetConstructorVisibility(MemberVisibility visibility) => _constructorVisibility = visibility;
+
+    public bool CanSetDirectly(IPropertySymbol propertySymbol) =>
+        ExistsInCurrentAssembly(propertySymbol)
+            ? propertySymbol is { SetMethod: not null, IsReadOnly: false } && IsDirectlyAccessible(propertySymbol.SetMethod)
+            : GetSetterMetadata(propertySymbol) is { CanSet: true, HasVisibleSetter: true };
+
+    public bool CanSet(IPropertySymbol propertySymbol) =>
+        ExistsInCurrentAssembly(propertySymbol)
+            ? propertySymbol is { SetMethod: not null, IsReadOnly: false } && IsMemberAccessible(propertySymbol.SetMethod)
+            : HasSetter(propertySymbol) && IsMemberAccessible(propertySymbol);
+
+    public bool IsInitOnly(IPropertySymbol propertySymbol) =>
+        ExistsInCurrentAssembly(propertySymbol)
+            ? propertySymbol.SetMethod?.IsInitOnly == true
+            : GetSetterMetadata(propertySymbol).IsInitOnly;
+
+    private bool HasSetter(IPropertySymbol propertySymbol) =>
+        ExistsInCurrentAssembly(propertySymbol) ? propertySymbol.SetMethod != null : GetSetterMetadata(propertySymbol).CanSet;
+
+    private bool ExistsInCurrentAssembly(ISymbol symbol) => symbol.Locations.All(x => x.IsInSource);
+
+    private readonly Dictionary<string, (bool CanSet, bool HasVisibleSetter, bool IsInitOnly)> _setterMetadataCache = [];
+
+    private (bool CanSet, bool HasVisibleSetter, bool IsInitOnly) GetSetterMetadata(IPropertySymbol propertySymbol)
+    {
+        var assemblySymbol = propertySymbol.ContainingType.ContainingAssembly;
+        if (_setterMetadataCache.TryGetValue(GetCacheKey(propertySymbol), out var setterMetadata))
+        {
+            return setterMetadata;
+        }
+
+        // Try to load from metadata reference
+        var metadataReference = Compilation
+            .References.OfType<PortableExecutableReference>()
+            .FirstOrDefault(r => SymbolEqualityComparer.Default.Equals(Compilation.GetAssemblyOrModuleSymbol(r), assemblySymbol));
+
+        var metadata = metadataReference?.GetMetadata();
+        if (metadata is AssemblyMetadata assemblyMetadata)
+        {
+            var module = assemblyMetadata.GetModules().First();
+            var reader = module.GetMetadataReader();
+
+            var targetTypeName = $"{propertySymbol.ContainingType.ContainingNamespace}.{propertySymbol.ContainingType.MetadataName}";
+            foreach (var typeDefHandle in reader.TypeDefinitions)
+            {
+                var typeDef = reader.GetTypeDefinition(typeDefHandle);
+                var typeName = GetFullTypeName(reader, typeDef);
+
+                if (!string.Equals(typeName, targetTypeName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                foreach (var propertyHandle in typeDef.GetProperties())
+                {
+                    var propertyDef = reader.GetPropertyDefinition(propertyHandle);
+                    var propertyName = reader.GetString(propertyDef.Name);
+                    if (!string.Equals(propertyName, propertySymbol.Name, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var accessors = propertyDef.GetAccessors();
+                    bool hasRegularSetter = !accessors.Setter.IsNil;
+                    bool hasInitSetter = false;
+                    bool hasPublicSetter = false;
+
+                    if (hasRegularSetter)
+                    {
+                        var setterDef = reader.GetMethodDefinition(accessors.Setter);
+                        hasPublicSetter = IsMethodPublic(setterDef.Attributes);
+                    }
+                    else
+                    {
+                        // Check for init setter
+                        foreach (var methodHandle in typeDef.GetMethods())
+                        {
+                            var methodDef = reader.GetMethodDefinition(methodHandle);
+                            var methodName = reader.GetString(methodDef.Name);
+
+                            if (string.Equals(methodName, $"set_{propertySymbol.Name}", StringComparison.Ordinal))
+                            {
+                                hasInitSetter = true;
+                                hasPublicSetter = IsMethodPublic(methodDef.Attributes);
+                                break;
+                            }
+                        }
+                    }
+
+                    bool hasSetter = hasRegularSetter || hasInitSetter;
+                    var setterMetaData = (hasSetter, hasPublicSetter, hasInitSetter);
+                    _setterMetadataCache[GetCacheKey(propertySymbol)] = setterMetaData;
+                    return setterMetaData;
+                }
+            }
+        }
+
+        _setterMetadataCache[GetCacheKey(propertySymbol)] = (false, false, false);
+        return (false, false, false);
+
+        static string GetCacheKey(IPropertySymbol propertySymbol)
+        {
+            return $"{propertySymbol.ContainingAssembly.Name}::{propertySymbol.ContainingType.ToDisplayString()}::{propertySymbol.Name}";
+        }
+
+        static string GetFullTypeName(MetadataReader reader, TypeDefinition typeDef)
+        {
+            var namespaceName = typeDef.Namespace.IsNil ? string.Empty : reader.GetString(typeDef.Namespace);
+            var typeName = reader.GetString(typeDef.Name);
+            return string.IsNullOrEmpty(namespaceName) ? typeName : $"{namespaceName}.{typeName}";
+        }
+
+        static bool IsMethodPublic(MethodAttributes attributes)
+        {
+            var accessibility = attributes & MethodAttributes.MemberAccessMask;
+            return accessibility == MethodAttributes.Public;
+        }
+    }
 
     public bool HasDirectlyAccessibleParameterlessConstructor(ITypeSymbol symbol) =>
         symbol is INamedTypeSymbol { IsAbstract: false } namedTypeSymbol

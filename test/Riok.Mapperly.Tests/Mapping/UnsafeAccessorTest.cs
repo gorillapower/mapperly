@@ -773,4 +773,28 @@ public class UnsafeAccessorTest
 
         return TestHelper.VerifyGenerator(source);
     }
+
+    [Fact]
+    public void PropertyWithPrivateSetterInExternalAssembly()
+    {
+        var bSource = TestSourceBuilder.SyntaxTree("""namespace B; public class B { public int Value { get; private set; } } """);
+        using var bAssembly = TestHelper.BuildAssembly("B", bSource);
+
+        var source = TestSourceBuilder.MapperWithBodyAndTypes(
+            "partial B.B Map(A source); ",
+            TestSourceBuilderOptions.WithMemberVisibility(MemberVisibility.All),
+            "class A { public int Value { get; set; } }"
+        );
+
+        TestHelper
+            .GenerateMapper(source, TestHelperOptions.Default, [bAssembly])
+            .Should()
+            .HaveMapMethodBody(
+                """
+                var target = new global::B.B();
+                target.SetValue(source.Value);
+                return target;
+                """
+            );
+    }
 }
